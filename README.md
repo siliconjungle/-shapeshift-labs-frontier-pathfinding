@@ -167,17 +167,17 @@ npm run bench
 
 The benchmark covers A*, smoothed A*, zero-heuristic Dijkstra-style search, flow-field generation/cache hits/batched steering, navmesh path/flow/steering, and patch-routed cell updates over synthetic fixtures.
 
-Latest local package benchmark on Node v26.1.0, darwin arm64, 96x96 grid and 40 rounds:
+Latest local package benchmark on Node v26.1.0, darwin arm64, 96x96 grid and 100 rounds:
 
 | Fixture | Median | p95 |
 | --- | ---: | ---: |
-| `astar-grid-96x96` | 254.25 us | 1.05 ms |
-| `astar-smooth-96x96` | 242.08 us | 1.11 ms |
-| `dijkstra-zero-heuristic-96x96` | 1.08 ms | 2.23 ms |
-| `flow-field-96x96` | 970.37 us | 1.31 ms |
-| `flow-field-cache-hit-96x96` | 0.54 us | 2.54 us |
-| `flow-field-steer-5000` | 220.46 us | 436.13 us |
-| `navmesh-path-256` | 46.42 us | 217.13 us |
-| `navmesh-flow-field-256` | 7.58 us | 59.96 us |
-| `navmesh-steer-5000` | 691.75 us | 1.22 ms |
-| `patch-cell-update-96x96` | 0.63 us | 14.71 us |
+| `astar-grid-96x96` | 220.33 us | 932.17 us |
+| `astar-smooth-96x96` | 199.46 us | 280.71 us |
+| `dijkstra-zero-heuristic-96x96` | 936.71 us | 1.35 ms |
+| `flow-field-96x96` | 868.96 us | 1.10 ms |
+| `flow-field-cache-hit-96x96` | 0.42 us | 2.67 us |
+| `flow-field-steer-5000` | 213.75 us | 425.25 us |
+| `navmesh-path-256` | 25.50 us | 127.54 us |
+| `navmesh-flow-field-256` | 6.54 us | 66.92 us |
+| `navmesh-steer-5000` | 302.96 us | 536.33 us |
+| `patch-cell-update-96x96` | 0.50 us | 2.92 us |

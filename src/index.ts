@@ -565,6 +565,27 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
     if (patch.length === 0) {
       return { changed: false, structural: false, patch, dirtyCellIndexes: [], generation: this.generationValue, origin: options.origin };
     }
+    if (patch.length === 1) {
+      const op = patch[0];
+      const path = op[1];
+      if (
+        op[0] === 0 &&
+        path.length === 2 &&
+        path[0] === 'cells' &&
+        typeof path[1] === 'number' &&
+        path[1] >= 0 &&
+        path[1] < this.costs.length &&
+        typeof op[2] === 'number'
+      ) {
+        const index = path[1];
+        const cost = normalizeCost(op[2]);
+        this.state.cells[index] = cost;
+        this.costs[index] = cost;
+        this.blocked[index] = cost <= 0 ? 1 : 0;
+        this.generationValue++;
+        return { changed: true, structural: false, patch, dirtyCellIndexes: [index], generation: this.generationValue, origin: options.origin };
+      }
+    }
     const dirtyCellIndexes: number[] = [];
     let structural = false;
     for (let i = 0; i < patch.length; i++) {
@@ -629,6 +650,8 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
     const height = this.height;
     const goalX = goalIndex % width;
     const goalY = Math.floor(goalIndex / width);
+    const dirLimit = diagonal === 'never' ? 4 : 8;
+    const zeroHeuristic = (options.heuristic ?? heuristicForDiagonal(diagonal)) === 'zero';
     const blocked = this.blocked;
     const costs = this.costs;
     const gScore = this.gScore;
@@ -641,7 +664,7 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
     let expanded = 0;
     let iterations = 0;
     let bestIndex = startIndex;
-    let bestHeuristic = heuristic(start.x, start.y, goalX, goalY);
+    let bestHeuristic = zeroHeuristic ? 0 : heuristic(start.x, start.y, goalX, goalY);
 
     heap.clear();
     gScore[startIndex] = 0;
@@ -661,16 +684,15 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
       }
       const cx = current % width;
       const cy = Math.floor(current / width);
-      for (let dir = 0; dir < 8; dir++) {
+      for (let dir = 0; dir < dirLimit; dir++) {
         const dx = DIR_X[dir];
         const dy = DIR_Y[dir];
-        if (dx !== 0 && dy !== 0 && diagonal === 'never') continue;
         const nx = cx + dx;
         const ny = cy + dy;
         if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
         const next = current + dx + dy * width;
         if (blocked[next] === 1 || closed[next] === searchId) continue;
-        const isDiagonal = dx !== 0 && dy !== 0;
+        const isDiagonal = dir >= 4;
         if (isDiagonal && diagonal !== 'always') {
           const horizontal = current + dx;
           const vertical = current + dy * width;
@@ -683,7 +705,7 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
         const stepCost = (isDiagonal ? SQRT2 : 1) * costs[next];
         const tentative = gScore[current] + stepCost;
         if (opened[next] !== searchId || tentative < gScore[next]) {
-          const hx = heuristic(cx + dx, cy + dy, goalX, goalY);
+          const hx = zeroHeuristic ? 0 : heuristic(nx, ny, goalX, goalY);
           gScore[next] = tentative;
           fScore[next] = tentative + hx * heuristicWeight;
           parent[next] = current;
@@ -732,6 +754,7 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
     const maxCost = options.maxCost ?? Number.POSITIVE_INFINITY;
     const width = this.width;
     const height = this.height;
+    const dirLimit = diagonal === 'never' ? 4 : 8;
     const blocked = this.blocked;
     const costs = this.costs;
     const heap = this.flowHeap;
@@ -750,16 +773,15 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
       reachable++;
       const cx = current % width;
       const cy = Math.floor(current / width);
-      for (let dir = 0; dir < 8; dir++) {
+      for (let dir = 0; dir < dirLimit; dir++) {
         const dx = DIR_X[dir];
         const dy = DIR_Y[dir];
-        if (dx !== 0 && dy !== 0 && diagonal === 'never') continue;
         const nx = cx + dx;
         const ny = cy + dy;
         if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
         const neighbor = current + dx + dy * width;
         if (blocked[neighbor] === 1) continue;
-        const isDiagonal = dx !== 0 && dy !== 0;
+        const isDiagonal = dir >= 4;
         if (isDiagonal && diagonal !== 'always') {
           const horizontal = current + dx;
           const vertical = current + dy * width;
@@ -783,6 +805,7 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
 
   connectedComponents(options: { diagonal?: FrontierPathfindingDiagonalMode } = {}): FrontierPathfindingConnectedComponents {
     const diagonal = options.diagonal ?? 'ifNoObstacles';
+    const dirLimit = diagonal === 'never' ? 4 : 8;
     const components = new Int32Array(this.costs.length);
     components.fill(NO_INDEX);
     const queue = new Int32Array(this.costs.length);
@@ -797,7 +820,7 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
         const current = queue[head++];
         const cx = current % this.width;
         const cy = Math.floor(current / this.width);
-        for (let dir = 0; dir < 8; dir++) {
+        for (let dir = 0; dir < dirLimit; dir++) {
           const dx = DIR_X[dir];
           const dy = DIR_Y[dir];
           if (!this.canMove(cx, cy, dx, dy, diagonal)) continue;
@@ -826,14 +849,18 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
     let y0 = Math.floor(from.y);
     const x1 = Math.floor(to.x);
     const y1 = Math.floor(to.y);
-    if (!this.isWalkable(x0, y0) || !this.isWalkable(x1, y1)) return false;
+    const width = this.width;
+    const height = this.height;
+    const blocked = this.blocked;
+    if (x0 < 0 || y0 < 0 || x0 >= width || y0 >= height || x1 < 0 || y1 < 0 || x1 >= width || y1 >= height) return false;
+    if (blocked[y0 * width + x0] === 1 || blocked[y1 * width + x1] === 1) return false;
     const dx = Math.abs(x1 - x0);
     const dy = Math.abs(y1 - y0);
     const sx = x0 < x1 ? 1 : -1;
     const sy = y0 < y1 ? 1 : -1;
     let error = dx - dy;
     for (;;) {
-      if (!this.isWalkable(x0, y0)) return false;
+      if (blocked[y0 * width + x0] === 1) return false;
       if (x0 === x1 && y0 === y1) return true;
       const e2 = error * 2;
       if (e2 > -dy) {
@@ -1078,6 +1105,7 @@ class FrontierNavMeshPathfinderImpl implements FrontierNavMeshPathfinder {
   private centroids: FrontierPathPoint[] = [];
   private polygonCosts = new Float64Array(0);
   private bounds: Array<{ minX: number; minY: number; maxX: number; maxY: number }> = [];
+  private axisAlignedRects = new Uint8Array(0);
   private locateIndex: NavMeshLocateIndex = emptyLocateIndex();
   private adjacency: NavMeshEdge[][] = [];
   private incoming: NavMeshIncomingEdge[][] = [];
@@ -1134,6 +1162,7 @@ class FrontierNavMeshPathfinderImpl implements FrontierNavMeshPathfinder {
       if (point.x < bounds.minX - EPSILON || point.x > bounds.maxX + EPSILON || point.y < bounds.minY - EPSILON || point.y > bounds.maxY + EPSILON) {
         continue;
       }
+      if (this.axisAlignedRects[i] === 1) return i;
       if (pointInPolygon(point, this.state.polygons[i].points)) return i;
     }
     return NO_INDEX;
@@ -1498,11 +1527,14 @@ class FrontierNavMeshPathfinderImpl implements FrontierNavMeshPathfinder {
     this.centroids = new Array<FrontierPathPoint>(count);
     this.polygonCosts = new Float64Array(count);
     this.bounds = new Array(count);
+    this.axisAlignedRects = new Uint8Array(count);
     for (let i = 0; i < count; i++) {
       const points = this.state.polygons[i].points;
+      const bounds = polygonBounds(points);
       this.centroids[i] = polygonCentroid(points);
       this.polygonCosts[i] = Math.max(EPSILON, this.state.polygons[i].cost ?? DEFAULT_COST);
-      this.bounds[i] = polygonBounds(points);
+      this.bounds[i] = bounds;
+      this.axisAlignedRects[i] = isAxisAlignedRectangle(points, bounds) ? 1 : 0;
     }
     this.locateIndex = buildNavMeshLocateIndex(this.bounds);
     const graph = buildNavMeshAdjacency(this.state, this.centroids);
@@ -1969,6 +2001,28 @@ function polygonBounds(points: readonly FrontierPathPoint[]): { minX: number; mi
   return Number.isFinite(minX) ? { minX, minY, maxX, maxY } : { minX: 0, minY: 0, maxX: 0, maxY: 0 };
 }
 
+function isAxisAlignedRectangle(
+  points: readonly FrontierPathPoint[],
+  bounds: { minX: number; minY: number; maxX: number; maxY: number }
+): boolean {
+  if (points.length !== 4 || bounds.maxX <= bounds.minX || bounds.maxY <= bounds.minY) return false;
+  let mask = 0;
+  for (let i = 0; i < points.length; i++) {
+    const point = points[i];
+    if (!sameCoord(point.x, bounds.minX) && !sameCoord(point.x, bounds.maxX)) return false;
+    if (!sameCoord(point.y, bounds.minY) && !sameCoord(point.y, bounds.maxY)) return false;
+    const next = points[(i + 1) & 3];
+    const vertical = sameCoord(point.x, next.x) && !sameCoord(point.y, next.y);
+    const horizontal = sameCoord(point.y, next.y) && !sameCoord(point.x, next.x);
+    if (!vertical && !horizontal) return false;
+    if (sameCoord(point.x, bounds.minX) && sameCoord(point.y, bounds.minY)) mask |= 1;
+    else if (sameCoord(point.x, bounds.maxX) && sameCoord(point.y, bounds.minY)) mask |= 2;
+    else if (sameCoord(point.x, bounds.maxX) && sameCoord(point.y, bounds.maxY)) mask |= 4;
+    else if (sameCoord(point.x, bounds.minX) && sameCoord(point.y, bounds.maxY)) mask |= 8;
+  }
+  return mask === 15;
+}
+
 function pointInPolygon(point: FrontierPathPoint, polygon: readonly FrontierPathPoint[]): boolean {
   if (polygon.length < 3) return false;
   let inside = false;
@@ -2019,6 +2073,10 @@ function collinear(a: FrontierPathPoint, b: FrontierPathPoint, c: FrontierPathPo
 
 function samePoint(left: FrontierPathPoint, right: FrontierPathPoint): boolean {
   return Math.abs(left.x - right.x) <= EPSILON && Math.abs(left.y - right.y) <= EPSILON;
+}
+
+function sameCoord(left: number, right: number): boolean {
+  return Math.abs(left - right) <= EPSILON;
 }
 
 function midpoint(left: FrontierPathPoint, right: FrontierPathPoint): FrontierPathPoint {
