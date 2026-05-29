@@ -1,0 +1,7 @@
+dist/
+dist-test/
+node_modules/
+benchmarks/results/
+*.tgz
+*.tsbuildinfo
+.DS_Store
