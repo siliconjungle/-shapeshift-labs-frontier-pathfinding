@@ -342,25 +342,49 @@ export function steerAgentsWithFlowField(
 ): FrontierPathfindingAgentStep[] {
   const speedFallback = Math.max(0, options.speed ?? 1);
   const arriveDistance = Math.max(0, options.arriveDistance ?? 0);
+  const width = flow.width;
+  const height = flow.height;
+  const distances = flow.distances;
+  const next = flow.next;
   const out = new Array<FrontierPathfindingAgentStep>(agents.length);
   for (let i = 0; i < agents.length; i++) {
     const agent = agents[i];
-    const sample = sampleFlowField(flow, agent);
     const speed = Math.max(0, agent.speed ?? speedFallback);
-    const arrived = sample.arrived || (sample.reachable && sample.distance <= arriveDistance);
-    const step = sample.reachable && !arrived ? Math.min(speed, sample.direction.length || speed) : 0;
+    const x = Math.floor(agent.x);
+    const y = Math.floor(agent.y);
+    const index = x >= 0 && y >= 0 && x < width && y < height ? y * width + x : NO_INDEX;
+    const distanceValue = index === NO_INDEX ? -1 : distances[index];
+    const reachable = index !== NO_INDEX && distanceValue >= 0;
+    const nextIndex = reachable ? next[index] ?? NO_INDEX : NO_INDEX;
+    const flowArrived = reachable && nextIndex === index;
+    const target = nextIndex >= 0 ? { x: nextIndex % width, y: Math.floor(nextIndex / width) } : undefined;
+    let directionX = 0;
+    let directionY = 0;
+    let directionLength = 0;
+    if (target && !flowArrived) {
+      const dx = target.x - agent.x;
+      const dy = target.y - agent.y;
+      directionLength = Math.hypot(dx, dy);
+      if (directionLength > EPSILON) {
+        const inverseLength = 1 / directionLength;
+        directionX = dx * inverseLength;
+        directionY = dy * inverseLength;
+      }
+    }
+    const arrived = flowArrived || (reachable && distanceValue <= arriveDistance);
+    const step = reachable && !arrived ? Math.min(speed, directionLength || speed) : 0;
     out[i] = {
       id: agent.id,
       x: agent.x,
       y: agent.y,
-      nextX: agent.x + sample.direction.x * step,
-      nextY: agent.y + sample.direction.y * step,
-      reachable: sample.reachable,
+      nextX: agent.x + directionX * step,
+      nextY: agent.y + directionY * step,
+      reachable,
       arrived,
-      distance: sample.distance,
-      directionX: sample.direction.x,
-      directionY: sample.direction.y,
-      target: sample.next
+      distance: reachable ? distanceValue : -1,
+      directionX,
+      directionY,
+      target
     };
   }
   return out;
@@ -392,6 +416,9 @@ export function steerAgentsWithNavMeshFlowField(
   agents: readonly FrontierPathfindingAgentInput[],
   options: FrontierPathfindingAgentStepOptions = {}
 ): FrontierPathfindingAgentStep[] {
+  if (navMesh instanceof FrontierNavMeshPathfinderImpl) {
+    return navMesh.steerAgentsWithFlowField(flow, agents, options);
+  }
   const speedFallback = Math.max(0, options.speed ?? 1);
   const arriveDistance = Math.max(0, options.arriveDistance ?? 0);
   const out = new Array<FrontierPathfindingAgentStep>(agents.length);
@@ -480,6 +507,10 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
   private parent: Int32Array;
   private opened: Uint32Array;
   private closed: Uint32Array;
+  private flowDistances: Float64Array;
+  private flowNext: Int32Array;
+  private flowSettled: Uint8Array;
+  private flowHeap: BinaryHeap;
   private searchId = 1;
   private generationValue = 0;
   private heap: BinaryHeap;
@@ -494,7 +525,11 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
     this.parent = new Int32Array(size);
     this.opened = new Uint32Array(size);
     this.closed = new Uint32Array(size);
+    this.flowDistances = new Float64Array(size);
+    this.flowNext = new Int32Array(size);
+    this.flowSettled = new Uint8Array(size);
     this.heap = new BinaryHeap(this.fScore, this.gScore);
+    this.flowHeap = new BinaryHeap(this.flowDistances, this.flowDistances);
     this.rebuildCaches();
   }
 
@@ -533,12 +568,33 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
     const dirtyCellIndexes: number[] = [];
     let structural = false;
     for (let i = 0; i < patch.length; i++) {
+      const op = patch[i];
       const path = patch[i][1];
-      if (path.length === 2 && path[0] === 'cells' && typeof path[1] === 'number') {
+      if (
+        op[0] === 0 &&
+        path.length === 2 &&
+        path[0] === 'cells' &&
+        typeof path[1] === 'number' &&
+        path[1] >= 0 &&
+        path[1] < this.costs.length &&
+        typeof op[2] === 'number'
+      ) {
         dirtyCellIndexes[dirtyCellIndexes.length] = path[1];
       } else {
         structural = true;
       }
+    }
+    if (!structural) {
+      for (let i = 0; i < patch.length; i++) {
+        const op = patch[i];
+        const index = op[1][1] as number;
+        const cost = normalizeCost(op[2] as number);
+        this.state.cells[index] = cost;
+        this.costs[index] = cost;
+        this.blocked[index] = cost <= 0 ? 1 : 0;
+      }
+      this.generationValue++;
+      return { changed: true, structural: false, patch, dirtyCellIndexes, generation: this.generationValue, origin: options.origin };
     }
     this.state = applyPatch(this.state as unknown as JsonValue, patch) as unknown as FrontierPathfindingGridSnapshot;
     this.generationValue++;
@@ -570,26 +626,35 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
     const maxIterations = Math.max(1, Math.floor(options.maxIterations ?? this.costs.length * 8));
     const searchId = this.nextSearchId();
     const width = this.width;
+    const height = this.height;
     const goalX = goalIndex % width;
     const goalY = Math.floor(goalIndex / width);
+    const blocked = this.blocked;
+    const costs = this.costs;
+    const gScore = this.gScore;
+    const fScore = this.fScore;
+    const parent = this.parent;
+    const opened = this.opened;
+    const closed = this.closed;
+    const heap = this.heap;
     let visited = 1;
     let expanded = 0;
     let iterations = 0;
     let bestIndex = startIndex;
     let bestHeuristic = heuristic(start.x, start.y, goalX, goalY);
 
-    this.heap.clear();
-    this.gScore[startIndex] = 0;
-    this.fScore[startIndex] = bestHeuristic * heuristicWeight;
-    this.parent[startIndex] = NO_INDEX;
-    this.opened[startIndex] = searchId;
-    this.heap.push(startIndex);
+    heap.clear();
+    gScore[startIndex] = 0;
+    fScore[startIndex] = bestHeuristic * heuristicWeight;
+    parent[startIndex] = NO_INDEX;
+    opened[startIndex] = searchId;
+    heap.push(startIndex);
 
-    while (this.heap.length > 0 && iterations < maxIterations) {
+    while (heap.length > 0 && iterations < maxIterations) {
       iterations++;
-      const current = this.heap.pop();
-      if (current === NO_INDEX || this.closed[current] === searchId) continue;
-      this.closed[current] = searchId;
+      const current = heap.pop();
+      if (current === NO_INDEX || closed[current] === searchId) continue;
+      closed[current] = searchId;
       expanded++;
       if (current === goalIndex) {
         return this.resultFrom(goalIndex, false, visited, expanded, iterations, options.smooth === true);
@@ -599,25 +664,38 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
       for (let dir = 0; dir < 8; dir++) {
         const dx = DIR_X[dir];
         const dy = DIR_Y[dir];
-        if (!this.canMove(cx, cy, dx, dy, diagonal)) continue;
+        if (dx !== 0 && dy !== 0 && diagonal === 'never') continue;
+        const nx = cx + dx;
+        const ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
         const next = current + dx + dy * width;
-        if (this.closed[next] === searchId) continue;
-        const stepCost = (dx !== 0 && dy !== 0 ? SQRT2 : 1) * this.costs[next];
-        const tentative = this.gScore[current] + stepCost;
-        if (this.opened[next] !== searchId || tentative < this.gScore[next]) {
+        if (blocked[next] === 1 || closed[next] === searchId) continue;
+        const isDiagonal = dx !== 0 && dy !== 0;
+        if (isDiagonal && diagonal !== 'always') {
+          const horizontal = current + dx;
+          const vertical = current + dy * width;
+          if (diagonal === 'onlyWhenNoObstacles') {
+            if (blocked[horizontal] !== 0 || blocked[vertical] !== 0) continue;
+          } else if (blocked[horizontal] !== 0 && blocked[vertical] !== 0) {
+            continue;
+          }
+        }
+        const stepCost = (isDiagonal ? SQRT2 : 1) * costs[next];
+        const tentative = gScore[current] + stepCost;
+        if (opened[next] !== searchId || tentative < gScore[next]) {
           const hx = heuristic(cx + dx, cy + dy, goalX, goalY);
-          this.gScore[next] = tentative;
-          this.fScore[next] = tentative + hx * heuristicWeight;
-          this.parent[next] = current;
-          if (this.opened[next] !== searchId) {
-            this.opened[next] = searchId;
+          gScore[next] = tentative;
+          fScore[next] = tentative + hx * heuristicWeight;
+          parent[next] = current;
+          if (opened[next] !== searchId) {
+            opened[next] = searchId;
             visited++;
           }
-          if (hx < bestHeuristic || (hx === bestHeuristic && tentative < this.gScore[bestIndex])) {
+          if (hx < bestHeuristic || (hx === bestHeuristic && tentative < gScore[bestIndex])) {
             bestHeuristic = hx;
             bestIndex = next;
           }
-          this.heap.push(next);
+          heap.push(next);
         }
       }
     }
@@ -641,22 +719,27 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
   flowField(goal: FrontierPathPoint, options: FrontierPathfindingFlowFieldOptions = {}): FrontierPathfindingFlowField {
     const goalIndex = this.indexForPoint(goal);
     const size = this.costs.length;
-    const distances = new Float64Array(size);
-    const next = new Int32Array(size);
+    const distances = this.flowDistances;
+    const next = this.flowNext;
+    const settled = this.flowSettled;
     distances.fill(Number.POSITIVE_INFINITY);
     next.fill(NO_INDEX);
+    settled.fill(0);
     if (goalIndex === NO_INDEX || this.blocked[goalIndex] === 1) {
       return this.flowFieldResult(goal, distances, next, 0);
     }
     const diagonal = options.diagonal ?? 'ifNoObstacles';
     const maxCost = options.maxCost ?? Number.POSITIVE_INFINITY;
-    const heap = new BinaryHeap(distances, distances);
-    const settled = new Uint8Array(size);
+    const width = this.width;
+    const height = this.height;
+    const blocked = this.blocked;
+    const costs = this.costs;
+    const heap = this.flowHeap;
+    heap.clear();
     distances[goalIndex] = 0;
     next[goalIndex] = goalIndex;
     heap.push(goalIndex);
     let reachable = 0;
-    const width = this.width;
     while (heap.length > 0) {
       const current = heap.pop();
       if (current === NO_INDEX) break;
@@ -670,9 +753,23 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
       for (let dir = 0; dir < 8; dir++) {
         const dx = DIR_X[dir];
         const dy = DIR_Y[dir];
-        if (!this.canMove(cx, cy, dx, dy, diagonal)) continue;
+        if (dx !== 0 && dy !== 0 && diagonal === 'never') continue;
+        const nx = cx + dx;
+        const ny = cy + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
         const neighbor = current + dx + dy * width;
-        const stepCost = (dx !== 0 && dy !== 0 ? SQRT2 : 1) * this.costs[current];
+        if (blocked[neighbor] === 1) continue;
+        const isDiagonal = dx !== 0 && dy !== 0;
+        if (isDiagonal && diagonal !== 'always') {
+          const horizontal = current + dx;
+          const vertical = current + dy * width;
+          if (diagonal === 'onlyWhenNoObstacles') {
+            if (blocked[horizontal] !== 0 || blocked[vertical] !== 0) continue;
+          } else if (blocked[horizontal] !== 0 && blocked[vertical] !== 0) {
+            continue;
+          }
+        }
+        const stepCost = (isDiagonal ? SQRT2 : 1) * costs[current];
         const candidate = currentCost + stepCost;
         if (candidate < distances[neighbor]) {
           distances[neighbor] = candidate;
@@ -843,7 +940,12 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
     reachable: number
   ): FrontierPathfindingFlowField {
     const outDistances = new Array<number>(distances.length);
-    for (let i = 0; i < distances.length; i++) outDistances[i] = Number.isFinite(distances[i]) ? distances[i] : -1;
+    const outNext = new Array<number>(next.length);
+    for (let i = 0; i < distances.length; i++) {
+      const distance = distances[i];
+      outDistances[i] = distance < Number.POSITIVE_INFINITY ? distance : -1;
+      outNext[i] = next[i];
+    }
     return {
       kind: 'frontier.pathfinding.flow-field',
       version: 1,
@@ -852,7 +954,7 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
       goal: { x: Math.floor(goal.x), y: Math.floor(goal.y) },
       generation: this.generationValue,
       distances: outDistances,
-      next: Array.from(next),
+      next: outNext,
       reachable
     };
   }
@@ -881,7 +983,11 @@ class FrontierGridPathfinderImpl implements FrontierGridPathfinder {
     this.parent = new Int32Array(size);
     this.opened = new Uint32Array(size);
     this.closed = new Uint32Array(size);
+    this.flowDistances = new Float64Array(size);
+    this.flowNext = new Int32Array(size);
+    this.flowSettled = new Uint8Array(size);
     this.heap = new BinaryHeap(this.fScore, this.gScore);
+    this.flowHeap = new BinaryHeap(this.flowDistances, this.flowDistances);
   }
 
   private rebuildCaches(): void {
@@ -940,11 +1046,13 @@ interface NavMeshEdge {
   portal: [FrontierPathPoint, FrontierPathPoint];
   midpoint: FrontierPathPoint;
   cost: number;
+  centroidDistance: number;
 }
 
 interface NavMeshIncomingEdge {
   from: number;
   cost: number;
+  centroidDistance: number;
 }
 
 interface NavMeshGraph {
@@ -968,6 +1076,7 @@ class FrontierNavMeshPathfinderImpl implements FrontierNavMeshPathfinder {
   private state: FrontierPathfindingNavMeshSnapshot;
   private generationValue = 0;
   private centroids: FrontierPathPoint[] = [];
+  private polygonCosts = new Float64Array(0);
   private bounds: Array<{ minX: number; minY: number; maxX: number; maxY: number }> = [];
   private locateIndex: NavMeshLocateIndex = emptyLocateIndex();
   private adjacency: NavMeshEdge[][] = [];
@@ -977,7 +1086,11 @@ class FrontierNavMeshPathfinderImpl implements FrontierNavMeshPathfinder {
   private parent = new Int32Array(0);
   private opened = new Uint32Array(0);
   private closed = new Uint32Array(0);
+  private flowDistances = new Float64Array(0);
+  private flowNextPolygons = new Int32Array(0);
+  private flowSettled = new Uint8Array(0);
   private heap = new BinaryHeap(this.scores, this.distances);
+  private flowHeap = new BinaryHeap(this.flowDistances, this.flowDistances);
   private searchId = 1;
 
   constructor(snapshot: FrontierPathfindingNavMeshSnapshot) {
@@ -1087,8 +1200,7 @@ class FrontierNavMeshPathfinderImpl implements FrontierNavMeshPathfinder {
         const edge = edges[i];
         const next = edge.to;
         if (this.closed[next] === searchId) continue;
-        const nextCost = this.state.polygons[next].cost ?? DEFAULT_COST;
-        const tentative = this.distances[current] + edge.cost + distance(this.centroids[current], this.centroids[next]) * Math.max(EPSILON, nextCost);
+        const tentative = this.distances[current] + edge.cost + edge.centroidDistance * this.polygonCosts[next];
         if (this.opened[next] !== searchId || tentative < this.distances[next]) {
           const heuristic = distance(this.centroids[next], goal);
           this.distances[next] = tentative;
@@ -1129,15 +1241,17 @@ class FrontierNavMeshPathfinderImpl implements FrontierNavMeshPathfinder {
   flowField(goal: FrontierPathPoint): FrontierPathfindingNavMeshFlowField {
     const goalPolygon = this.locate(goal);
     const count = this.polygonCount;
-    const distances = new Float64Array(count);
-    const nextPolygons = new Int32Array(count);
+    const distances = this.flowDistances;
+    const nextPolygons = this.flowNextPolygons;
+    const settled = this.flowSettled;
     distances.fill(Number.POSITIVE_INFINITY);
     nextPolygons.fill(NO_INDEX);
+    settled.fill(0);
     if (goalPolygon === NO_INDEX) {
       return this.navMeshFlowFieldResult(goal, goalPolygon, distances, nextPolygons, 0);
     }
-    const heap = new BinaryHeap(distances, distances);
-    const settled = new Uint8Array(count);
+    const heap = this.flowHeap;
+    heap.clear();
     distances[goalPolygon] = 0;
     nextPolygons[goalPolygon] = goalPolygon;
     heap.push(goalPolygon);
@@ -1149,9 +1263,10 @@ class FrontierNavMeshPathfinderImpl implements FrontierNavMeshPathfinder {
       settled[current] = 1;
       reachable++;
       const edges = this.incoming[current];
+      const currentPolygonCost = this.polygonCosts[current];
       for (let i = 0; i < edges.length; i++) {
         const neighbor = edges[i].from;
-        const stepCost = edges[i].cost + distance(this.centroids[current], this.centroids[neighbor]) * Math.max(EPSILON, this.state.polygons[current].cost ?? DEFAULT_COST);
+        const stepCost = edges[i].cost + edges[i].centroidDistance * currentPolygonCost;
         const candidate = distances[current] + stepCost;
         if (candidate < distances[neighbor]) {
           distances[neighbor] = candidate;
@@ -1198,6 +1313,70 @@ class FrontierNavMeshPathfinderImpl implements FrontierNavMeshPathfinder {
       distance: flow.distances[polygon],
       direction: arrived ? { x: 0, y: 0, length: 0 } : direction
     };
+  }
+
+  steerAgentsWithFlowField(
+    flow: FrontierPathfindingNavMeshFlowField,
+    agents: readonly FrontierPathfindingAgentInput[],
+    options: FrontierPathfindingAgentStepOptions = {}
+  ): FrontierPathfindingAgentStep[] {
+    const speedFallback = Math.max(0, options.speed ?? 1);
+    const arriveDistance = Math.max(0, options.arriveDistance ?? 0);
+    const out = new Array<FrontierPathfindingAgentStep>(agents.length);
+    const stale = flow.generation !== this.generationValue;
+    for (let i = 0; i < agents.length; i++) {
+      const agent = agents[i];
+      const speed = Math.max(0, agent.speed ?? speedFallback);
+      let polygon = NO_INDEX;
+      let nextPolygon = NO_INDEX;
+      let reachable = false;
+      let flowArrived = false;
+      let distanceValue = -1;
+      let target: FrontierPathPoint | undefined;
+      let directionX = 0;
+      let directionY = 0;
+      let directionLength = 0;
+
+      if (!stale) {
+        polygon = this.locate(agent);
+        if (polygon !== NO_INDEX) {
+          distanceValue = flow.distances[polygon];
+          reachable = distanceValue >= 0;
+          if (reachable) {
+            nextPolygon = flow.nextPolygons[polygon] ?? NO_INDEX;
+            flowArrived = polygon === flow.goalPolygon || nextPolygon === polygon;
+            target = flowArrived ? flow.goal : this.edgeBetween(polygon, nextPolygon)?.midpoint;
+            if (target && !flowArrived) {
+              const dx = target.x - agent.x;
+              const dy = target.y - agent.y;
+              directionLength = Math.hypot(dx, dy);
+              if (directionLength > EPSILON) {
+                const inverseLength = 1 / directionLength;
+                directionX = dx * inverseLength;
+                directionY = dy * inverseLength;
+              }
+            }
+          }
+        }
+      }
+
+      const arrived = flowArrived || (reachable && distanceValue <= arriveDistance);
+      const step = reachable && !arrived ? Math.min(speed, directionLength || speed) : 0;
+      out[i] = {
+        id: agent.id,
+        x: agent.x,
+        y: agent.y,
+        nextX: agent.x + directionX * step,
+        nextY: agent.y + directionY * step,
+        reachable,
+        arrived,
+        distance: reachable ? distanceValue : -1,
+        directionX,
+        directionY,
+        target
+      };
+    }
+    return out;
   }
 
   private navMeshResultFrom(
@@ -1269,7 +1448,12 @@ class FrontierNavMeshPathfinderImpl implements FrontierNavMeshPathfinder {
     reachable: number
   ): FrontierPathfindingNavMeshFlowField {
     const outDistances = new Array<number>(distances.length);
-    for (let i = 0; i < distances.length; i++) outDistances[i] = Number.isFinite(distances[i]) ? distances[i] : -1;
+    const outNextPolygons = new Array<number>(nextPolygons.length);
+    for (let i = 0; i < distances.length; i++) {
+      const distance = distances[i];
+      outDistances[i] = distance < Number.POSITIVE_INFINITY ? distance : -1;
+      outNextPolygons[i] = nextPolygons[i];
+    }
     return {
       kind: 'frontier.pathfinding.navmesh-flow-field',
       version: 1,
@@ -1277,7 +1461,7 @@ class FrontierNavMeshPathfinderImpl implements FrontierNavMeshPathfinder {
       goal: { x: goal.x, y: goal.y },
       goalPolygon,
       distances: outDistances,
-      nextPolygons: Array.from(nextPolygons),
+      nextPolygons: outNextPolygons,
       reachable
     };
   }
@@ -1312,10 +1496,12 @@ class FrontierNavMeshPathfinderImpl implements FrontierNavMeshPathfinder {
     this.state = normalizeNavMeshSnapshot(this.state);
     const count = this.state.polygons.length;
     this.centroids = new Array<FrontierPathPoint>(count);
+    this.polygonCosts = new Float64Array(count);
     this.bounds = new Array(count);
     for (let i = 0; i < count; i++) {
       const points = this.state.polygons[i].points;
       this.centroids[i] = polygonCentroid(points);
+      this.polygonCosts[i] = Math.max(EPSILON, this.state.polygons[i].cost ?? DEFAULT_COST);
       this.bounds[i] = polygonBounds(points);
     }
     this.locateIndex = buildNavMeshLocateIndex(this.bounds);
@@ -1327,7 +1513,11 @@ class FrontierNavMeshPathfinderImpl implements FrontierNavMeshPathfinder {
     this.parent = new Int32Array(count);
     this.opened = new Uint32Array(count);
     this.closed = new Uint32Array(count);
+    this.flowDistances = new Float64Array(count);
+    this.flowNextPolygons = new Int32Array(count);
+    this.flowSettled = new Uint8Array(count);
     this.heap = new BinaryHeap(this.scores, this.distances);
+    this.flowHeap = new BinaryHeap(this.flowDistances, this.flowDistances);
   }
 }
 
@@ -1346,12 +1536,17 @@ class BinaryHeap {
 
   push(value: number): void {
     const nodes = this.nodes;
+    const primary = this.primary;
+    const tie = this.tie;
+    const valuePrimary = primary[value];
+    const valueTie = tie[value];
     let index = nodes.length;
     nodes[index] = value;
     while (index > 0) {
       const parentIndex = (index - 1) >> 1;
       const parent = nodes[parentIndex];
-      if (this.compare(parent, value) <= 0) break;
+      const parentPrimary = primary[parent];
+      if (parentPrimary < valuePrimary || (parentPrimary === valuePrimary && tie[parent] <= valueTie)) break;
       nodes[index] = parent;
       index = parentIndex;
     }
@@ -1364,28 +1559,33 @@ class BinaryHeap {
     const first = nodes[0];
     const last = nodes.pop() as number;
     if (nodes.length > 0) {
+      const primary = this.primary;
+      const tie = this.tie;
+      const lastPrimary = primary[last];
+      const lastTie = tie[last];
       let index = 0;
       const half = nodes.length >> 1;
       while (index < half) {
         let childIndex = index * 2 + 1;
         let child = nodes[childIndex];
         const rightIndex = childIndex + 1;
-        if (rightIndex < nodes.length && this.compare(nodes[rightIndex], child) < 0) {
-          childIndex = rightIndex;
-          child = nodes[rightIndex];
+        if (rightIndex < nodes.length) {
+          const right = nodes[rightIndex];
+          const rightPrimary = primary[right];
+          const childPrimary = primary[child];
+          if (rightPrimary < childPrimary || (rightPrimary === childPrimary && tie[right] < tie[child])) {
+            childIndex = rightIndex;
+            child = right;
+          }
         }
-        if (this.compare(last, child) <= 0) break;
+        const childPrimary = primary[child];
+        if (lastPrimary < childPrimary || (lastPrimary === childPrimary && lastTie <= tie[child])) break;
         nodes[index] = child;
         index = childIndex;
       }
       nodes[index] = last;
     }
     return first;
-  }
-
-  private compare(left: number, right: number): number {
-    const primaryDelta = this.primary[left] - this.primary[right];
-    return primaryDelta !== 0 ? primaryDelta : this.tie[left] - this.tie[right];
   }
 }
 
@@ -1605,14 +1805,16 @@ function buildNavMeshAdjacency(snapshot: FrontierPathfindingNavMeshSnapshot, cen
   const outgoing = Array.from({ length: snapshot.polygons.length }, () => [] as NavMeshEdge[]);
   const incoming = Array.from({ length: snapshot.polygons.length }, () => [] as NavMeshIncomingEdge[]);
   const add = (from: number, to: number, portal: [FrontierPathPoint, FrontierPathPoint], cost: number) => {
+    const centroidDistance = distance(centroids[from], centroids[to]);
     const edge: NavMeshEdge = {
       to,
       portal: clonePortal(portal),
       midpoint: midpoint(portal[0], portal[1]),
-      cost
+      cost,
+      centroidDistance
     };
     outgoing[from].push(edge);
-    incoming[to].push({ from, cost });
+    incoming[to].push({ from, cost, centroidDistance });
   };
   for (let i = 0; i < snapshot.connections.length; i++) {
     const connection = snapshot.connections[i];
@@ -1623,8 +1825,8 @@ function buildNavMeshAdjacency(snapshot: FrontierPathfindingNavMeshSnapshot, cen
   }
   for (let i = 0; i < outgoing.length; i++) {
     outgoing[i].sort((left, right) => {
-      const leftDistance = distance(centroids[i], centroids[left.to]);
-      const rightDistance = distance(centroids[i], centroids[right.to]);
+      const leftDistance = left.centroidDistance;
+      const rightDistance = right.centroidDistance;
       return leftDistance === rightDistance ? left.to - right.to : leftDistance - rightDistance;
     });
   }
