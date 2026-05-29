@@ -1,6 +1,6 @@
 # @shapeshift-labs/frontier-pathfinding
 
-Patch-native pathfinding primitives for Frontier game, scene, automation, and AI stacks. The package stores navigation state as JSON, accepts Frontier patch tuples for mutation, and keeps hot grid search state in typed-array caches.
+Patch-native pathfinding primitives for Frontier game, scene, automation, and AI stacks. The package stores navigation state as JSON, accepts Frontier patch tuples for mutation, and keeps hot grid/navmesh search state in typed-array caches.
 
 - npm: [`@shapeshift-labs/frontier-pathfinding`](https://www.npmjs.com/package/@shapeshift-labs/frontier-pathfinding)
 - source: [`siliconjungle/-shapeshift-labs-frontier-pathfinding`](https://github.com/siliconjungle/-shapeshift-labs-frontier-pathfinding)
@@ -9,9 +9,14 @@ Patch-native pathfinding primitives for Frontier game, scene, automation, and AI
 
 ```ts
 import {
+  createFlowFieldCache,
   createGridPathfinder,
+  createNavMeshPathfinder,
   gridFromStrings,
+  navMeshFromPolygons,
   schedulePathfind,
+  steerAgentsWithFlowField,
+  steerAgentsWithNavMeshFlowField,
   setCellPatch
 } from '@shapeshift-labs/frontier-pathfinding';
 
@@ -34,7 +39,24 @@ nav.commit(setCellPatch(nav.width, 4, 2, 0), {
 });
 
 const flow = nav.flowField({ x: 9, y: 4 });
+const flowCache = createFlowFieldCache(nav, { capacity: 8 });
+const cachedFlow = flowCache.get({ x: 9, y: 4 }, { diagonal: 'ifNoObstacles' });
+const nextAgents = steerAgentsWithFlowField(cachedFlow, [
+  { id: 'npc:1', x: 0, y: 0, speed: 1 },
+  { id: 'npc:2', x: 2, y: 4, speed: 1 }
+]);
 const components = nav.connectedComponents();
+
+const navMesh = createNavMeshPathfinder(navMeshFromPolygons([
+  { id: 'room-a', points: [{ x: 0, y: 0 }, { x: 4, y: 0 }, { x: 4, y: 4 }, { x: 0, y: 4 }] },
+  { id: 'room-b', points: [{ x: 4, y: 0 }, { x: 8, y: 0 }, { x: 8, y: 4 }, { x: 4, y: 4 }] }
+]));
+
+const meshPath = navMesh.findPath({ x: 1, y: 1 }, { x: 7, y: 1 });
+const meshFlow = navMesh.flowField({ x: 7, y: 1 });
+const nextMeshAgents = steerAgentsWithNavMeshFlowField(navMesh, meshFlow, [
+  { id: 'npc:3', x: 1, y: 1, speed: 1 }
+]);
 
 schedulePathfind(scheduler, nav, {
   start: { x: 0, y: 0 },
@@ -55,6 +77,10 @@ The internal model follows the rest of Frontier:
 - A* and Dijkstra-style search share a reusable typed-array search context.
 - Diagonal movement follows PathFinding.js-style policies: `never`, `always`, `ifNoObstacles`, and `onlyWhenNoObstacles`.
 - Flow fields provide one-to-many navigation for groups of agents.
+- Flow-field caches reuse a single goal field across large agent batches until the grid generation changes.
+- Navmesh snapshots are serializable polygon graphs with explicit or shared-edge auto connections.
+- Navmesh search, navmesh flow fields, and batched navmesh steering use the same JSON-friendly point/path payloads as grids.
+- Navmesh point location is bucket-indexed so many agents can sample a flow field without scanning every polygon.
 - Connected components expose cheap reachability regions for AI/game code.
 - Line-of-sight smoothing gives a Theta*-style post-process without making any-angle search the only mode.
 - Scheduler integration is structural, so `frontier-scheduler` can queue path work without becoming a dependency.
@@ -139,14 +165,19 @@ Run package-local measurements:
 npm run bench
 ```
 
-The benchmark covers A*, smoothed A*, zero-heuristic Dijkstra-style search, flow-field generation, and patch-routed cell updates over a synthetic weighted grid.
+The benchmark covers A*, smoothed A*, zero-heuristic Dijkstra-style search, flow-field generation/cache hits/batched steering, navmesh path/flow/steering, and patch-routed cell updates over synthetic fixtures.
 
-Latest local package benchmark on Node v26.1.0, darwin arm64, 96x96 grid and 40 rounds:
+Latest local package benchmark on Node v26.1.0, darwin arm64, 96x96 grid and 30 rounds:
 
 | Fixture | Median | p95 |
 | --- | ---: | ---: |
-| `astar-grid-96x96` | 284.42 us | 518.58 us |
-| `astar-smooth-96x96` | 245.83 us | 947.08 us |
-| `dijkstra-zero-heuristic-96x96` | 1.14 ms | 2.49 ms |
-| `flow-field-96x96` | 1.18 ms | 1.68 ms |
-| `patch-cell-update-96x96` | 0.79 us | 9.54 us |
+| `astar-grid-96x96` | 298.33 us | 677.21 us |
+| `astar-smooth-96x96` | 307.21 us | 540.37 us |
+| `dijkstra-zero-heuristic-96x96` | 1.26 ms | 2.57 ms |
+| `flow-field-96x96` | 1.37 ms | 1.78 ms |
+| `flow-field-cache-hit-96x96` | 0.54 us | 4.17 us |
+| `flow-field-steer-5000` | 388.54 us | 1.68 ms |
+| `navmesh-path-256` | 60.50 us | 195.71 us |
+| `navmesh-flow-field-256` | 29.71 us | 92.46 us |
+| `navmesh-steer-5000` | 680.96 us | 1.36 ms |
+| `patch-cell-update-96x96` | 0.75 us | 10.17 us |

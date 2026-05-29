@@ -2,6 +2,8 @@ import assert from 'node:assert';
 import {
   cellIndex,
   createGridPathfinder,
+  createNavMeshPathfinder,
+  navMeshFromPolygons,
   setCellPatch
 } from '../dist/index.js';
 
@@ -31,6 +33,16 @@ for (let i = 0; i < cases; i++) {
   const nextCost = chance(0.5) ? 0 : randInt(1, 4);
   pathfinder.commit(setCellPatch(width, patchIndex % width, Math.floor(patchIndex / width), nextCost));
   assert.strictEqual(pathfinder.snapshot().cells[patchIndex], nextCost);
+
+  const rooms = randInt(2, 8);
+  const navMesh = createNavMeshPathfinder(navMeshFromPolygons(makeRoomStrip(rooms)));
+  const navPath = navMesh.findPath({ x: 0.5, y: 0.5 }, { x: rooms * 4 - 0.5, y: 0.5 });
+  assert.strictEqual(navPath.found, true, 'navmesh strip path mismatch ' + JSON.stringify({ seed, rooms }));
+  assert.strictEqual(navPath.polygons.length, rooms);
+  const navFlow = navMesh.flowField({ x: rooms * 4 - 0.5, y: 0.5 });
+  const navSample = navMesh.sampleFlow(navFlow, { x: 0.5, y: 0.5 });
+  assert.strictEqual(navSample.reachable, true);
+  if (rooms > 1) assert.strictEqual(navSample.nextPolygon, 1);
 }
 
 console.log(`frontier pathfinding fuzz passed: cases=${cases}`);
@@ -50,6 +62,24 @@ function randomWalkable(width, height, cells) {
     if (cells[cellIndex(width, x, y)] > 0) return { x, y };
   }
   return { x: 0, y: 0 };
+}
+
+function makeRoomStrip(count) {
+  const out = [];
+  for (let i = 0; i < count; i++) {
+    const x = i * 4;
+    out.push({
+      id: 'room-' + i,
+      points: [
+        { x, y: 0 },
+        { x: x + 4, y: 0 },
+        { x: x + 4, y: 4 },
+        { x, y: 4 }
+      ],
+      cost: randInt(1, 3)
+    });
+  }
+  return out;
 }
 
 function referenceDijkstra(width, height, cells, start, goal, diagonal) {

@@ -53,15 +53,23 @@ function linkLocalPackage(name, targetDir) {
   const parts = name.split('/');
   const scopeDir = path.join(packageDir, 'node_modules', ...parts.slice(0, -1));
   const linkPath = path.join(packageDir, 'node_modules', ...parts);
+  const target = path.relative(path.dirname(linkPath), targetDir);
   fs.mkdirSync(scopeDir, { recursive: true });
   try {
     const stat = fs.lstatSync(linkPath);
     if (!stat.isSymbolicLink()) return;
+    if (fs.readlinkSync(linkPath) === target) return;
     fs.unlinkSync(linkPath);
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  fs.symlinkSync(path.relative(path.dirname(linkPath), targetDir), linkPath, 'dir');
+  try {
+    fs.symlinkSync(target, linkPath, 'dir');
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+    const stat = fs.lstatSync(linkPath);
+    if (!stat.isSymbolicLink() || fs.readlinkSync(linkPath) !== target) throw error;
+  }
 }
 
 function isPackageBuildCurrent(targetDir) {

@@ -3,7 +3,12 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import {
+  createFlowFieldCache,
   createGridPathfinder,
+  createNavMeshPathfinder,
+  navMeshFromPolygons,
+  steerAgentsWithFlowField,
+  steerAgentsWithNavMeshFlowField,
   setCellPatch
 } from '../dist/index.js';
 
@@ -21,6 +26,14 @@ const cells = makeMap(size, size);
 const pathfinder = createGridPathfinder({ width: size, height: size, cells });
 const start = { x: 1, y: 1 };
 const goal = { x: size - 2, y: size - 2 };
+const flowCache = createFlowFieldCache(pathfinder, { capacity: 8 });
+const cachedFlow = flowCache.get(goal, { diagonal: 'ifNoObstacles' });
+const gridAgents = makeGridAgents(5000, size);
+const navMesh = createNavMeshPathfinder(navMeshFromPolygons(makeNavMeshStrip(256)));
+const navStart = { x: 0.5, y: 0.5 };
+const navGoal = { x: 1023.5, y: 0.5 };
+const navFlow = navMesh.flowField(navGoal);
+const navAgents = makeNavMeshAgents(5000);
 let sinkCounter = 0;
 
 const rows = [
@@ -35,6 +48,21 @@ const rows = [
   }),
   measure('flow-field-' + size + 'x' + size, () => {
     return pathfinder.flowField(goal, { diagonal: 'ifNoObstacles' }).reachable;
+  }),
+  measure('flow-field-cache-hit-' + size + 'x' + size, () => {
+    return flowCache.get(goal, { diagonal: 'ifNoObstacles' }).reachable;
+  }),
+  measure('flow-field-steer-5000', () => {
+    return steerAgentsWithFlowField(cachedFlow, gridAgents, { speed: 1 }).length;
+  }),
+  measure('navmesh-path-256', () => {
+    return navMesh.findPath(navStart, navGoal).polygons.length;
+  }),
+  measure('navmesh-flow-field-256', () => {
+    return navMesh.flowField(navGoal).reachable;
+  }),
+  measure('navmesh-steer-5000', () => {
+    return steerAgentsWithNavMeshFlowField(navMesh, navFlow, navAgents, { speed: 1 }).length;
   }),
   measure('patch-cell-update-' + size + 'x' + size, () => {
     const x = 2 + (sinkCounter++ % (size - 4));
@@ -97,6 +125,50 @@ function makeMap(width, height) {
   }
   out[1 * width + 1] = 1;
   out[(height - 2) * width + (width - 2)] = 1;
+  return out;
+}
+
+function makeGridAgents(count, size) {
+  const out = new Array(count);
+  for (let i = 0; i < count; i++) {
+    out[i] = {
+      id: i,
+      x: 1 + (i % (size - 2)),
+      y: 1 + (Math.floor(i / (size - 2)) % (size - 2)),
+      speed: 1
+    };
+  }
+  return out;
+}
+
+function makeNavMeshStrip(count) {
+  const out = new Array(count);
+  for (let i = 0; i < count; i++) {
+    const x = i * 4;
+    out[i] = {
+      id: 'poly-' + i,
+      points: [
+        { x, y: 0 },
+        { x: x + 4, y: 0 },
+        { x: x + 4, y: 4 },
+        { x, y: 4 }
+      ]
+    };
+  }
+  return out;
+}
+
+function makeNavMeshAgents(count) {
+  const out = new Array(count);
+  for (let i = 0; i < count; i++) {
+    const polygon = i % 256;
+    out[i] = {
+      id: i,
+      x: polygon * 4 + 0.5,
+      y: 0.5 + (i % 7) * 0.4,
+      speed: 1
+    };
+  }
   return out;
 }
 

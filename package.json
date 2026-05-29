@@ -1,7 +1,7 @@
 {
   "name": "@shapeshift-labs/frontier-pathfinding",
   "version": "0.1.0",
-  "description": "Patch-native grid and graph pathfinding primitives for Frontier game, scene, and automation stacks.",
+  "description": "Patch-native grid, flow-field, and navmesh pathfinding primitives for Frontier game, scene, and automation stacks.",
   "type": "module",
   "license": "MIT",
   "sideEffects": false,
@@ -47,7 +47,9 @@
     "frontier",
     "pathfinding",
     "astar",
+    "flow-field",
     "grid",
+    "navmesh",
     "game",
     "navigation"
   ],
